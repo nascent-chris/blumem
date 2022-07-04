@@ -8,5 +8,6 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.58"
 boolinator = "2.4"
+memmap = "0.7.0"
 regex = "1.5"
 thiserror = "1.0.31"

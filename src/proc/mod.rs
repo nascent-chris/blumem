@@ -1,16 +1,17 @@
 use anyhow::Result;
 use boolinator::Boolinator;
 use std::{
-    fs::File,
-    io::{BufRead, BufReader},
+    fs::{self, File, OpenOptions},
+    io::{prelude::*, BufReader, Seek, SeekFrom},
     ops::Not,
-    path,
+    path::{self, Component},
 };
 use thiserror::Error;
 //                          address 1,2                    perms 3,4,5,6            offset           dev                           inode     pathname 7
 const MAPS_REGEX: &str = r"([0-9A-Fa-f]+)-([0-9A-Fa-f]+) ([-r])([-w])([-x])([-ps]) (?:[0-9A-Fa-f]+) (?:[0-9A-Fa-f]+:[0-9A-Fa-f]+) (?:\d+)\s+(.*)?";
 
 #[derive(Debug)]
+#[allow(unused)]
 pub struct MemRegion {
     start_addr: u64,
     end_addr: u64,
@@ -30,30 +31,88 @@ pub enum MemRegionErr {
 }
 
 #[derive(Debug)]
-pub(crate) struct Proc {
-    pub name: String,
-    pub pid: u32,
+#[allow(unused)]
+pub struct Proc {
+    name: String,
+    pid: u32,
     path: path::PathBuf,
+    regions: Option<Vec<MemRegion>>,
+    mem: Option<File>,
 }
 
 impl Proc {
+    pub fn search(&mut self, val: &[u8]) -> Result<Vec<u64>> {
+        // Explicitly use the bytes regex
+        use regex::bytes::RegexBuilder;
+
+        let valstr = val
+            .iter()
+            .map(|b| format!("\\x{:02x}", b))
+            .collect::<String>();
+
+        let re = RegexBuilder::new(&valstr.to_string())
+            .unicode(false)
+            .dot_matches_new_line(true)
+            .case_insensitive(false)
+            .build()?;
+
+        let regions = self.regions.as_ref().ok_or(MemRegionErr::Empty)?;
+
+        let results = regions
+            .iter()
+            .map(|region| {
+                self.mem.as_mut().map(|memfile| {
+                    memfile
+                        .seek(SeekFrom::Start(region.start_addr))
+                        .and_then(|_| {
+                            let mut reader = BufReader::with_capacity(region.size, memfile);
+                            let filled = reader.fill_buf()?;
+                            let found = re
+                                .find_iter(filled)
+                                .map(|m| region.start_addr + m.start() as u64)
+                                .collect::<Vec<_>>();
+                            Ok(found)
+                        })
+                })
+            })
+            .flatten()
+            .flatten()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        Ok(results)
+    }
+
     pub fn new(name: String, pid: u32) -> Self {
         Self {
             name,
             pid,
             path: path::Path::new("/proc").join(&pid.to_string()),
+            regions: None,
+            mem: None,
         }
     }
 
-    pub fn parse_maps(&self) -> Result<Vec<MemRegion>> {
+    pub fn open_mem(&mut self) -> Result<()> {
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(false)
+            .open(self.path.join("mem"))?;
+        self.mem = Some(f);
+        Ok(())
+    }
+
+    // pub fn parse_maps(&self) -> Result<Vec<MemRegion>> {
+    pub fn parse_maps(&mut self) -> Result<()> {
         use regex::RegexBuilder;
         let buf = File::open(self.path.join("maps")).map(BufReader::new)?;
-        let mut builder = RegexBuilder::new(MAPS_REGEX);
-        builder
+
+        let re = RegexBuilder::new(MAPS_REGEX)
             .unicode(true)
             .dot_matches_new_line(true)
-            .case_insensitive(false);
-        let re = builder.build()?;
+            .case_insensitive(false)
+            .build()?;
 
         let res = buf
             .lines()
@@ -67,11 +126,9 @@ impl Proc {
                     let end_addr = cap
                         .get(2)
                         .and_then(|v| u64::from_str_radix(v.as_str(), 16).ok())?;
-
                     let [readable, writeable, execable, private, shared] =
                         [(3, "r"), (4, "w"), (5, "x"), (6, "p"), (6, "s")]
                             .map(|(i, s)| cap.get(i).map(|v| v.as_str() == s).unwrap_or(false));
-
                     let name = cap.get(7).and_then(|v| {
                         v.as_str()
                             .is_empty()
@@ -79,7 +136,6 @@ impl Proc {
                             .as_option()
                             .map(|_| v.as_str().to_string())
                     });
-
                     Some(MemRegion {
                         start_addr,
                         end_addr,
@@ -97,9 +153,29 @@ impl Proc {
             .flatten()
             .collect::<Vec<_>>();
 
-        res.is_empty()
-            .not()
-            .as_result(res, MemRegionErr::Empty)
-            .map_err(Into::into)
+        self.regions = Some(res.is_empty().not().as_result(res, MemRegionErr::Empty)?);
+
+        Ok(())
     }
+}
+
+pub fn find_proc(proc_name: &str) -> Result<Vec<Proc>> {
+    fs::read_dir("/proc/")
+        .map(|dir| {
+            dir.flatten()
+                .map(|dir| dir.path())
+                .flat_map(|path| std::fs::read_to_string(path.join("cmdline")).map(|s| (path, s)))
+                .filter(|(_, s)| !s.is_empty() && s.contains(proc_name))
+                .flat_map(|(p, s)| {
+                    p.components()
+                        .last()
+                        .and_then(|c| match c {
+                            Component::Normal(c) => c.to_string_lossy().parse::<u32>().ok(),
+                            _ => None,
+                        })
+                        .map(|pid| Proc::new(s.trim().replace('\x00', ""), pid))
+                })
+                .collect()
+        })
+        .map_err(Into::into)
 }
