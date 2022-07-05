@@ -2,11 +2,13 @@ use anyhow::Result;
 use boolinator::Boolinator;
 use std::{
     fs::{self, File, OpenOptions},
-    io::{prelude::*, BufReader, Seek, SeekFrom},
+    io::{prelude::*, BufReader, ErrorKind, Seek, SeekFrom},
     ops::Not,
     path::{self, Component},
 };
 use thiserror::Error;
+
+use crate::search_results::SearchResult;
 //                          address 1,2                    perms 3,4,5,6            offset           dev                           inode     pathname 7
 const MAPS_REGEX: &str = r"([0-9A-Fa-f]+)-([0-9A-Fa-f]+) ([-r])([-w])([-x])([-ps]) (?:[0-9A-Fa-f]+) (?:[0-9A-Fa-f]+:[0-9A-Fa-f]+) (?:\d+)\s+(.*)?";
 
@@ -41,7 +43,7 @@ pub struct Proc {
 }
 
 impl Proc {
-    pub fn search(&mut self, val: &[u8]) -> Result<Vec<u64>> {
+    pub fn search_new(&mut self, val: &[u8]) -> Result<Vec<SearchResult>> {
         // Explicitly use the bytes regex
         use regex::bytes::RegexBuilder;
 
@@ -50,7 +52,7 @@ impl Proc {
             .map(|b| format!("\\x{:02x}", b))
             .collect::<String>();
 
-        let re = RegexBuilder::new(&valstr.to_string())
+        let re = RegexBuilder::new(&valstr)
             .unicode(false)
             .dot_matches_new_line(true)
             .case_insensitive(false)
@@ -60,7 +62,7 @@ impl Proc {
 
         let results = regions
             .iter()
-            .map(|region| {
+            .filter_map(|region| {
                 self.mem.as_mut().map(|memfile| {
                     memfile
                         .seek(SeekFrom::Start(region.start_addr))
@@ -71,12 +73,17 @@ impl Proc {
                                 .find_iter(filled)
                                 .map(|m| region.start_addr + m.start() as u64)
                                 .collect::<Vec<_>>();
-                            Ok(found)
+
+                            found.is_empty().not().as_result(
+                                SearchResult {
+                                    module: region.name.clone(),
+                                    results: found,
+                                },
+                                std::io::Error::new(ErrorKind::Other, "oh no!"),
+                            )
                         })
                 })
             })
-            .flatten()
-            .flatten()
             .flatten()
             .collect::<Vec<_>>();
 
@@ -118,7 +125,7 @@ impl Proc {
             .lines()
             .into_iter()
             .flatten()
-            .map(|line| {
+            .filter_map(|line| {
                 re.captures(&line).map(|cap| {
                     let start_addr = cap
                         .get(1)
@@ -149,7 +156,6 @@ impl Proc {
                     })
                 })
             })
-            .flatten()
             .flatten()
             .collect::<Vec<_>>();
 

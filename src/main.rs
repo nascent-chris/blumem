@@ -1,4 +1,7 @@
 mod proc;
+mod search_results;
+
+use std::io;
 
 use anyhow::Result;
 
@@ -25,14 +28,22 @@ fn main() -> Result<()> {
 
     println!("procs {:#X?}", procs);
 
-    let search_str = 1234.567f32.to_le_bytes();
+    loop {
+        let mut buffer = String::new();
+        io::stdin().read_line(&mut buffer)?;
+        let search_val: f32 = buffer.trim().parse()?;
+        let search_str = search_val.to_le_bytes();
 
-    let search_res = procs
-        .iter_mut()
-        .map(|proc| proc.search(&search_str))
-        .collect::<Vec<_>>();
+        println!("search_str: {:X?}", search_str);
 
-    println!("search_res: {:#X?}", search_res);
+        let search_res = procs
+            .iter_mut()
+            .flat_map(|proc| proc.search_new(&search_str))
+            .flatten()
+            .collect::<Vec<_>>();
 
-    Ok(())
+        println!("search_res: {:#X?}", search_res);
+    }
+
+    // Ok(())
 }
